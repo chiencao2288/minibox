@@ -237,8 +237,8 @@ if [ -f /etc/bash.bashrc ]; then
     . /etc/bash.bashrc
 fi
 
-# Colored prompt with box identity
-PS1='\[\033[01;32m\]\u@\[\033[01;35m\]minibox\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '
+# Colored prompt with box identity (user@box-name)
+PS1='\[\033[01;32m\]\u@\[\033[01;35m\]\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '
 
 alias ls='ls --color=auto'
 alias ll='ls -la --color=auto'
@@ -288,7 +288,7 @@ Diagnostics & Setup Commands:
 
 Creation Options (create):
   --image=<preset|url>             Image preset: normal (default), wine, ai, or custom image URL
-  --user=<name>                    Override container username (default: box name without -box)
+  --user=<name>                    Override container username (default: matches host user)
   --home=<path>                    Specify custom host home directory (default: ~/.local/share/minibox/boxes/<box>/home)
   --mounts                         Auto-mount external/secondary drives (/run/media, /mnt) with RW access
 
@@ -417,12 +417,12 @@ cmd_create() {
         image_preset="normal"
     fi
 
-    # Resolve target username
+    # Resolve target username (defaults 1:1 with host user)
     local target_user
     if [[ -n "$user_override" ]]; then
         target_user="$(sanitize_username "$user_override")"
     else
-        target_user="$(sanitize_username "$box_name")"
+        target_user="$(sanitize_username "${USER:-$(id -un)}")"
     fi
 
     if [[ -z "$target_user" ]]; then

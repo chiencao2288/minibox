@@ -17,6 +17,7 @@ Lightweight rootless Debian GUI container manager for **Podman** on Fedora Linux
 ## Key Features
 
 - **Strict Home Directory Isolation:** Prevents host pollution. All user caches, configuration files, and game saves remain isolated in `~/.local/share/minibox/boxes/<box-name>/home`.
+- **1:1 Host User Mapping & Box Hostname:** Container username defaults 1:1 with your host user, while the container hostname matches the box name, yielding a clean and recognizable shell prompt (`user@box-name:~$`). You can still override via `--user=<name>`.
 - **100% Native Podman Architecture (No Prescripts):** Relies on native Podman features (`--userns=keep-id`, `--passwd-entry`, `--group-entry`, `--group-add keep-groups`, `--init`, volume `:U,z`) for instant container startup and proper process reaping.
 - **Automatic Multi-GPU Hardware Acceleration:** Automatically attaches available AMD/Intel DRI devices (`/dev/dri`, `/dev/kfd`) and NVIDIA GPUs via Container Device Interface (CDI `nvidia.com/gpu=all`).
 - **Pure Wayland & PipeWire Integration:** Native Wayland socket forwarding (`wayland-0`) and PipeWire audio (`pipewire-0`) without legacy X11 overhead.
