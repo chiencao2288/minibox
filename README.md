@@ -29,11 +29,26 @@ Lightweight rootless Debian GUI container manager for **Podman** on Fedora Linux
 
 ---
 
+## ⚡ Quick Install (One-Liner)
+
+Install `minibox` directly into `~/.local/bin` with a single command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/chiencao2288/minibox/main/install.sh | bash
+```
+
+To install into a custom directory:
+```bash
+curl -fsSL https://raw.githubusercontent.com/chiencao2288/minibox/main/install.sh | bash -s /usr/local/bin
+```
+
+---
+
 ## Quickstart & Usage
 
 ### Basic Syntax
 ```bash
-./minibox <command> [options...]
+minibox <command> [options...]
 ```
 
 ### Container Management
