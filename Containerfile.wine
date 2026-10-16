@@ -25,8 +25,10 @@ RUN dpkg --add-architecture i386 \
     libgl1-mesa-dri:i386 \
     libglx-mesa0 \
     libglx-mesa0:i386 \
-    libegl1-mesa \
-    libegl1-mesa:i386 \
+    libegl-mesa0 \
+    libegl-mesa0:i386 \
+    libegl1 \
+    libegl1:i386 \
     libvulkan1 \
     libvulkan1:i386 \
     mesa-vulkan-drivers \

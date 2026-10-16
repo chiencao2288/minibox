@@ -29,7 +29,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     wayland-protocols \
     libgl1-mesa-dri \
     libglx-mesa0 \
-    libegl1-mesa \
+    libegl-mesa0 \
+    libegl1 \
     libvulkan1 \
     mesa-vulkan-drivers \
     vulkan-tools \
