@@ -1,0 +1,818 @@
+#!/usr/bin/env bash
+#
+# minibox - Lightweight rootless Debian GUI container manager for Podman
+#
+# Description:
+#   Manages isolated Debian GUI containers using native rootless Podman mechanisms.
+#   Provides pure Wayland display, PipeWire audio, automatic GPU acceleration,
+#   and complete home directory isolation.
+#
+
+set -euo pipefail
+
+# -----------------------------------------------------------------------------
+# Global Constants & Defaults
+# -----------------------------------------------------------------------------
+
+readonly MINIBOX_VERSION="1.0.0"
+readonly DEFAULT_REGISTRY_BASE="ghcr.io/chiencao2288/debian-box"
+readonly PRESET_NORMAL="${DEFAULT_REGISTRY_BASE}:normal"
+readonly PRESET_WINE="${DEFAULT_REGISTRY_BASE}:wine"
+readonly PRESET_AI="${DEFAULT_REGISTRY_BASE}:ai"
+
+readonly XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+readonly MINIBOX_DATA_DIR="$XDG_DATA_HOME/minibox"
+readonly MINIBOX_BOXES_DIR="$MINIBOX_DATA_DIR/boxes"
+
+# -----------------------------------------------------------------------------
+# Logging Functions
+# -----------------------------------------------------------------------------
+
+## Prints informational message to stderr.
+## Arguments:
+##   $* Message string.
+log_info() {
+    printf '\033[1;34m[INFO]\033[0m %s\n' "$*" >&2
+}
+
+## Prints warning message to stderr.
+## Arguments:
+##   $* Warning string.
+log_warn() {
+    printf '\033[1;33m[WARN]\033[0m %s\n' "$*" >&2
+}
+
+## Prints error message to stderr.
+## Arguments:
+##   $* Error string.
+log_error() {
+    printf '\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2
+}
+
+## Prints error message and terminates program.
+## Arguments:
+##   $* Error message.
+die() {
+    log_error "$*"
+    exit 1
+}
+
+# -----------------------------------------------------------------------------
+# Helper Functions
+# -----------------------------------------------------------------------------
+
+## Verifies prerequisite binaries and environment constraints.
+## Enforces rootless execution, Podman availability, Wayland session, and Fedora host.
+## Returns:
+##   0 on success, exits 1 on fatal violation.
+check_prerequisites() {
+    # 1. Enforce rootless execution
+    if [[ "$(id -u)" -eq 0 ]]; then
+        die "minibox must be executed as a regular user (rootless mode). Do not run with sudo or as root."
+    fi
+
+    # 2. Enforce Podman availability
+    if ! command -v podman >/dev/null 2>&1; then
+        die "Podman not found in PATH. Please install Podman first (Fedora: sudo dnf install podman)."
+    fi
+
+    # 3. Check for Wayland session
+    if [[ -z "${WAYLAND_DISPLAY:-}" && "${XDG_SESSION_TYPE:-}" != "wayland" ]]; then
+        log_warn "Wayland session not detected (XDG_SESSION_TYPE='${XDG_SESSION_TYPE:-unknown}'). minibox requires Wayland for GUI support."
+    fi
+
+    # 4. Check for Fedora host
+    if [[ -f "/etc/os-release" ]] && ! grep -qi "fedora" /etc/os-release; then
+        log_warn "Host OS is not detected as Fedora Linux. minibox is officially engineered and supported for Fedora."
+    fi
+}
+
+## Sanitizes container username based on box name or user override.
+## Strips trailing '-box', lowercases, replaces non-alphanumeric with '_',
+## ensures valid starting character, and caps length at 32 characters.
+## Arguments:
+##   $1 Raw box name or user string.
+## Outputs:
+##   Sanitized username string.
+sanitize_username() {
+    local raw="$1"
+    raw="${raw%-box}"
+    local sanitized
+    sanitized="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_]/_/g')"
+
+    if [[ ! "$sanitized" =~ ^[a-z_] ]]; then
+        sanitized="_$sanitized"
+    fi
+
+    printf '%s' "${sanitized:0:32}"
+}
+
+## Resolves image string from preset keyword or custom image reference.
+## Arguments:
+##   $1 Image preset ('normal', 'wine', 'ai') or full image reference.
+## Outputs:
+##   Resolved container image URL.
+resolve_image() {
+    local input="$1"
+    case "$input" in
+        normal|default|latest)
+            printf '%s' "$PRESET_NORMAL"
+            ;;
+        wine)
+            printf '%s' "$PRESET_WINE"
+            ;;
+        ai|cuda)
+            printf '%s' "$PRESET_AI"
+            ;;
+        *)
+            printf '%s' "$input"
+            ;;
+    esac
+}
+
+## Detects host Wayland display and constructs Podman volume/env arguments.
+## Outputs:
+##   Array of podman argument strings separated by newlines.
+detect_wayland_args() {
+    local host_uid
+    host_uid="$(id -u)"
+    local wayland_socket="${WAYLAND_DISPLAY:-wayland-0}"
+    local host_socket_path="${XDG_RUNTIME_DIR:-/run/user/$host_uid}/$wayland_socket"
+
+    if [[ -S "$host_socket_path" ]]; then
+        printf '%s\n' "--volume" "$host_socket_path:/run/user/$host_uid/$wayland_socket:z"
+        printf '%s\n' "--env" "WAYLAND_DISPLAY=$wayland_socket"
+        printf '%s\n' "--env" "XDG_RUNTIME_DIR=/run/user/$host_uid"
+    else
+        log_warn "Wayland socket not found at '$host_socket_path'. Wayland GUI applications may fail to start."
+    fi
+}
+
+## Detects host PipeWire socket and constructs Podman volume arguments.
+## Outputs:
+##   Array of podman argument strings separated by newlines.
+detect_pipewire_args() {
+    local host_uid
+    host_uid="$(id -u)"
+    local host_pw_path="${XDG_RUNTIME_DIR:-/run/user/$host_uid}/pipewire-0"
+
+    if [[ -S "$host_pw_path" ]]; then
+        printf '%s\n' "--volume" "$host_pw_path:/run/user/$host_uid/pipewire-0:z"
+        printf '%s\n' "--env" "PIPEWIRE_RUNTIME_DIR=/run/user/$host_uid"
+    fi
+}
+
+## Scans host GPU hardware (AMD DRI, KFD, Nvidia CDI) and constructs device arguments.
+## Outputs:
+##   Array of podman argument strings separated by newlines.
+detect_gpu_args() {
+    if [[ -d "/dev/dri" ]]; then
+        printf '%s\n' "--device" "/dev/dri"
+    fi
+
+    if [[ -e "/dev/kfd" ]]; then
+        printf '%s\n' "--device" "/dev/kfd"
+    fi
+
+    local cdi_found=false
+    for cdi_path in /etc/cdi/nvidia.yaml /var/run/cdi/nvidia.yaml /etc/containers/cdi/nvidia.yaml; do
+        if [[ -f "$cdi_path" ]]; then
+            cdi_found=true
+            break
+        fi
+    done
+
+    if [[ "$cdi_found" == "true" ]]; then
+        printf '%s\n' "--device" "nvidia.com/gpu=all"
+    fi
+
+    printf '%s\n' "--group-add" "keep-groups"
+}
+
+## Scans external and secondary disk mountpoints (/run/media, /mnt).
+## Excludes host root, host home, and system hierarchies.
+## Outputs:
+##   Array of podman argument strings separated by newlines.
+detect_mount_args() {
+    local mount_target
+    while IFS= read -r mount_target; do
+        [[ -n "$mount_target" && -d "$mount_target" ]] || continue
+        printf '%s\n' "--volume" "$mount_target:$mount_target:rw,rslave"
+    done < <(findmnt -rn -o TARGET 2>/dev/null | grep -E '^/(run/media|mnt)/' || true)
+}
+
+## Checks if container currently exists in Podman.
+## Arguments:
+##   $1 Box / container name.
+## Returns:
+##   0 if exists, 1 otherwise.
+is_box_exist() {
+    local box_name="$1"
+    podman container exists "$box_name" 2>/dev/null
+}
+
+## Checks if container is running.
+## Arguments:
+##   $1 Box / container name.
+## Returns:
+##   0 if running, 1 otherwise.
+is_box_running() {
+    local box_name="$1"
+    local status
+    status="$(podman inspect --format '{{.State.Status}}' "$box_name" 2>/dev/null || true)"
+    [[ "$status" == "running" ]]
+}
+
+## Initializes minimal user shell profile in target home directory if absent.
+## Arguments:
+##   $1 Absolute path to isolated home directory.
+init_home_skeleton() {
+    local target_home="$1"
+    mkdir -p "$target_home"
+
+    if [[ ! -f "$target_home/.bashrc" ]]; then
+        cat <<'EOF' > "$target_home/.bashrc"
+# ~/.bashrc for minibox user
+if [ -f /etc/bash.bashrc ]; then
+    . /etc/bash.bashrc
+fi
+
+# Colored prompt with box identity
+PS1='\[\033[01;32m\]\u@\[\033[01;35m\]minibox\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '
+
+alias ls='ls --color=auto'
+alias ll='ls -la --color=auto'
+alias grep='grep --color=auto'
+EOF
+    fi
+
+    if [[ ! -f "$target_home/.profile" ]]; then
+        cat <<'EOF' > "$target_home/.profile"
+# ~/.profile for minibox user
+if [ -n "$BASH_VERSION" ]; then
+    if [ -f "$HOME/.bashrc" ]; then
+        . "$HOME/.bashrc"
+    fi
+fi
+EOF
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Subcommands
+# -----------------------------------------------------------------------------
+
+## Displays CLI usage guide.
+cmd_help() {
+    cat <<EOF
+minibox v${MINIBOX_VERSION} - Rootless Debian GUI container manager for Podman
+
+Usage:
+  minibox <command> [options...]
+
+Container Management Commands:
+  create <box-name> [options...]   Create a new box
+  start <box-name>                 Start box in persistent daemon mode
+  stop <box-name>                  Stop a running box
+  restart <box-name>               Restart a box
+  shell <box-name> [command...]    Launch interactive shell or run command as box user
+  root <box-name> [command...]     Launch interactive shell or run command as root
+  list, ls                         List all managed boxes and their statuses
+  rm <box-name> [--purge]          Remove container (add --purge to delete isolated home)
+
+Diagnostics & Setup Commands:
+  gpu-probe                        Probe host GPU acceleration (AMD DRI, KFD, Nvidia CDI)
+  provision [preset]               Pull or build container images (normal, wine, ai)
+  version                          Show minibox version
+  help                             Display this help guide
+
+Creation Options (create):
+  --image=<preset|url>             Image preset: normal (default), wine, ai, or custom image URL
+  --user=<name>                    Override container username (default: box name without -box)
+  --home=<path>                    Specify custom host home directory (default: ~/.local/share/minibox/boxes/<box>/home)
+  --mounts                         Auto-mount external/secondary drives (/run/media, /mnt) with RW access
+
+Examples:
+  minibox create game-box --image=wine --mounts
+  minibox shell game-box
+  minibox root game-box apt update
+  minibox list
+  minibox rm game-box
+EOF
+}
+
+## Probes and prints graphics hardware acceleration state on the host system.
+cmd_gpu_probe() {
+    log_info "Probing graphics hardware (GPU) on host..."
+    printf '\n'
+
+    # 1. Direct Rendering Infrastructure (DRI)
+    printf '\033[1m[1] Direct Rendering Infrastructure (/dev/dri):\033[0m\n'
+    if [[ -d "/dev/dri" ]]; then
+        ls -la /dev/dri
+    else
+        printf '  No /dev/dri detected\n'
+    fi
+    printf '\n'
+
+    # 2. Kernel Fusion Driver (KFD)
+    printf '\033[1m[2] AMD Kernel Fusion Driver (/dev/kfd):\033[0m\n'
+    if [[ -e "/dev/kfd" ]]; then
+        ls -la /dev/kfd
+    else
+        printf '  No /dev/kfd detected (AMD compute not enabled or non-AMD GPU)\n'
+    fi
+    printf '\n'
+
+    # 3. NVIDIA CDI & Driver
+    printf '\033[1m[3] NVIDIA Container Device Interface (CDI) configuration:\033[0m\n'
+    local cdi_active=false
+    for cdi_file in /etc/cdi/nvidia.yaml /var/run/cdi/nvidia.yaml /etc/containers/cdi/nvidia.yaml; do
+        if [[ -f "$cdi_file" ]]; then
+            printf '  ✓ Found CDI configuration at: %s\n' "$cdi_file"
+            cdi_active=true
+        fi
+    done
+    if [[ "$cdi_active" == "false" ]]; then
+        printf '  ✕ No nvidia.yaml CDI configuration found (run "nvidia-ctk cdi generate" if needed)\n'
+    fi
+
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        printf '\n\033[1m[4] nvidia-smi status:\033[0m\n'
+        nvidia-smi -L || true
+    fi
+}
+
+## Pulls or prepares container images for a given preset.
+## Arguments:
+##   $1 Optional preset name ('normal', 'wine', 'ai').
+cmd_provision() {
+    local preset="${1:-normal}"
+    local target_image
+    target_image="$(resolve_image "$preset")"
+
+    log_info "Pulling container image for preset '$preset': $target_image"
+    if podman pull "$target_image"; then
+        log_info "Image pulled successfully: $target_image"
+    else
+        log_warn "Failed to pull image from registry '$target_image'."
+        log_info "You can build the image locally with Containerfile.$preset using:"
+        printf '  podman build -t %s -f Containerfile.%s .\n' "$target_image" "$preset"
+    fi
+}
+
+## Creates a new minibox container.
+## Arguments:
+##   $* Command line arguments.
+cmd_create() {
+    if [[ $# -lt 1 ]]; then
+        die "Missing box name. Usage: minibox create <box-name> [options...]"
+    fi
+
+    local box_name="$1"
+    shift
+
+    if is_box_exist "$box_name"; then
+        die "Box '$box_name' already exists. Please choose a different name or remove the old box."
+    fi
+
+    local image_preset="normal"
+    local raw_image=""
+    local user_override=""
+    local home_override=""
+    local enable_mounts=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --image=*)
+                raw_image="${1#*=}"
+                ;;
+            --user=*)
+                user_override="${1#*=}"
+                ;;
+            --home=*)
+                home_override="${1#*=}"
+                ;;
+            --mounts|--mount-drives)
+                enable_mounts=true
+                ;;
+            -h|--help)
+                cmd_help
+                return 0
+                ;;
+            *)
+                die "Invalid option: $1"
+                ;;
+        esac
+        shift
+    done
+
+    # Resolve target image
+    local final_image
+    if [[ -n "$raw_image" ]]; then
+        final_image="$(resolve_image "$raw_image")"
+        image_preset="$raw_image"
+    else
+        final_image="$PRESET_NORMAL"
+        image_preset="normal"
+    fi
+
+    # Resolve target username
+    local target_user
+    if [[ -n "$user_override" ]]; then
+        target_user="$(sanitize_username "$user_override")"
+    else
+        target_user="$(sanitize_username "$box_name")"
+    fi
+
+    if [[ -z "$target_user" ]]; then
+        target_user="minibox"
+    fi
+
+    # Resolve isolated home path
+    local target_home
+    if [[ -n "$home_override" ]]; then
+        target_home="$home_override"
+    else
+        target_home="$MINIBOX_BOXES_DIR/$box_name/home"
+    fi
+
+    local host_uid host_gid
+    host_uid="$(id -u)"
+    host_gid="$(id -g)"
+
+    log_info "Initializing box '$box_name'..."
+    log_info "  - User:      $target_user (UID: $host_uid, GID: $host_gid)"
+    log_info "  - Home:      $target_home"
+    log_info "  - Image:     $final_image ($image_preset)"
+    log_info "  - Mounts:    $enable_mounts"
+
+    # Prepare home directory and shell skeleton
+    init_home_skeleton "$target_home"
+
+    # Check image availability
+    if ! podman image exists "$final_image" 2>/dev/null; then
+        log_info "Image '$final_image' not found locally, pulling..."
+        if ! podman pull "$final_image"; then
+            log_warn "Failed to pull image from registry. Check local image or build via Containerfile."
+        fi
+    fi
+
+    # Build dynamic arguments
+    local -a wayland_args=()
+    mapfile -t wayland_args < <(detect_wayland_args)
+
+    local -a pipewire_args=()
+    mapfile -t pipewire_args < <(detect_pipewire_args)
+
+    local -a gpu_args=()
+    mapfile -t gpu_args < <(detect_gpu_args)
+
+    local -a mount_args=()
+    if [[ "$enable_mounts" == "true" ]]; then
+        mapfile -t mount_args < <(detect_mount_args)
+    fi
+
+    # Run native Podman create command
+    podman create \
+        --name "$box_name" \
+        --hostname "$box_name" \
+        --init \
+        --label "minibox=true" \
+        --label "minibox.name=$box_name" \
+        --label "minibox.user=$target_user" \
+        --label "minibox.home=$target_home" \
+        --label "minibox.preset=$image_preset" \
+        --label "minibox.image=$final_image" \
+        --security-opt label=disable \
+        --ipc=host \
+        --userns=keep-id \
+        --passwd-entry="$target_user:x:$host_uid:$host_gid:$target_user:/home/$target_user:/bin/bash" \
+        --group-entry="$target_user:x:$host_gid:" \
+        --workdir "/home/$target_user" \
+        --volume "$target_home:/home/$target_user:U,z" \
+        "${wayland_args[@]}" \
+        "${pipewire_args[@]}" \
+        "${gpu_args[@]}" \
+        "${mount_args[@]}" \
+        "$final_image" \
+        sleep infinity >/dev/null
+
+    # Persist metadata for standalone inspection
+    local meta_dir="$MINIBOX_BOXES_DIR/$box_name"
+    mkdir -p "$meta_dir"
+    cat <<EOF > "$meta_dir/config.env"
+BOX_NAME="$box_name"
+CONTAINER_USER="$target_user"
+BOX_HOME="$target_home"
+IMAGE="$final_image"
+PRESET="$image_preset"
+MOUNTS="$enable_mounts"
+CREATED_AT="$(date -Iseconds)"
+EOF
+
+    log_info "Box '$box_name' created successfully! Run 'minibox shell $box_name' to start using it."
+}
+
+## Starts an existing stopped container.
+## Arguments:
+##   $1 Box name.
+cmd_start() {
+    if [[ $# -lt 1 ]]; then
+        die "Missing box name. Usage: minibox start <box-name>"
+    fi
+    local box_name="$1"
+
+    if ! is_box_exist "$box_name"; then
+        die "Box '$box_name' does not exist."
+    fi
+
+    if is_box_running "$box_name"; then
+        log_info "Box '$box_name' is already running."
+        return 0
+    fi
+
+    log_info "Starting box '$box_name'..."
+    podman start "$box_name" >/dev/null
+    log_info "Box '$box_name' is ready."
+}
+
+## Stops a running container.
+## Arguments:
+##   $1 Box name.
+cmd_stop() {
+    if [[ $# -lt 1 ]]; then
+        die "Missing box name. Usage: minibox stop <box-name>"
+    fi
+    local box_name="$1"
+
+    if ! is_box_exist "$box_name"; then
+        die "Box '$box_name' does not exist."
+    fi
+
+    if ! is_box_running "$box_name"; then
+        log_info "Box '$box_name' is already stopped."
+        return 0
+    fi
+
+    log_info "Stopping box '$box_name'..."
+    podman stop -t 2 "$box_name" >/dev/null
+    log_info "Box '$box_name' stopped."
+}
+
+## Restarts a container.
+## Arguments:
+##   $1 Box name.
+cmd_restart() {
+    if [[ $# -lt 1 ]]; then
+        die "Missing box name. Usage: minibox restart <box-name>"
+    fi
+    local box_name="$1"
+
+    if ! is_box_exist "$box_name"; then
+        die "Box '$box_name' does not exist."
+    fi
+
+    log_info "Restarting box '$box_name'..."
+    podman restart -t 2 "$box_name" >/dev/null
+    log_info "Box '$box_name' restarted."
+}
+
+## Enters container shell or executes command as unprivileged container user.
+## Arguments:
+##   $1 Box name.
+##   $2.. Command arguments (optional).
+cmd_shell() {
+    if [[ $# -lt 1 ]]; then
+        die "Missing box name. Usage: minibox shell <box-name> [command...]"
+    fi
+    local box_name="$1"
+    shift
+
+    if ! is_box_exist "$box_name"; then
+        die "Box '$box_name' does not exist."
+    fi
+
+    if ! is_box_running "$box_name"; then
+        cmd_start "$box_name"
+    fi
+
+    local target_user
+    target_user="$(podman inspect --format '{{index .Config.Labels "minibox.user"}}' "$box_name" 2>/dev/null || true)"
+    if [[ -z "$target_user" ]]; then
+        target_user="$(sanitize_username "$box_name")"
+    fi
+
+    local host_uid
+    host_uid="$(id -u)"
+
+    local -a it_flag=("-i")
+    if [[ -t 0 && -t 1 ]]; then
+        it_flag+=("-t")
+    fi
+
+    if [[ $# -eq 0 ]]; then
+        exec podman exec "${it_flag[@]}" \
+            --user="$target_user" \
+            -e HOME="/home/$target_user" \
+            -e USER="$target_user" \
+            -e WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" \
+            -e XDG_RUNTIME_DIR="/run/user/$host_uid" \
+            -e PIPEWIRE_RUNTIME_DIR="/run/user/$host_uid" \
+            -e TERM="${TERM:-xterm-256color}" \
+            "$box_name" /bin/bash --login
+    else
+        exec podman exec "${it_flag[@]}" \
+            --user="$target_user" \
+            -e HOME="/home/$target_user" \
+            -e USER="$target_user" \
+            -e WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" \
+            -e XDG_RUNTIME_DIR="/run/user/$host_uid" \
+            -e PIPEWIRE_RUNTIME_DIR="/run/user/$host_uid" \
+            -e TERM="${TERM:-xterm-256color}" \
+            "$box_name" "$@"
+    fi
+}
+
+## Enters container shell or executes command as root.
+## Arguments:
+##   $1 Box name.
+##   $2.. Command arguments (optional).
+cmd_root() {
+    if [[ $# -lt 1 ]]; then
+        die "Missing box name. Usage: minibox root <box-name> [command...]"
+    fi
+    local box_name="$1"
+    shift
+
+    if ! is_box_exist "$box_name"; then
+        die "Box '$box_name' does not exist."
+    fi
+
+    if ! is_box_running "$box_name"; then
+        cmd_start "$box_name"
+    fi
+
+    local -a it_flag=("-i")
+    if [[ -t 0 && -t 1 ]]; then
+        it_flag+=("-t")
+    fi
+
+    if [[ $# -eq 0 ]]; then
+        exec podman exec "${it_flag[@]}" \
+            --user=root \
+            -e TERM="${TERM:-xterm-256color}" \
+            "$box_name" /bin/bash --login
+    else
+        exec podman exec "${it_flag[@]}" \
+            --user=root \
+            -e TERM="${TERM:-xterm-256color}" \
+            "$box_name" "$@"
+    fi
+}
+
+## Lists all managed minibox containers and their status.
+cmd_list() {
+    local -a boxes
+    mapfile -t boxes < <(podman ps -a --filter "label=minibox=true" --format "{{.Names}}" 2>/dev/null || true)
+
+    if [[ ${#boxes[@]} -eq 0 ]]; then
+        log_info "No boxes found. Create your first box using: minibox create <box-name>"
+        return 0
+    fi
+
+    printf '%-18s %-12s %-12s %-10s %s\n' "BOX NAME" "STATUS" "USER" "PRESET" "HOME DIRECTORY"
+    printf '%-18s %-12s %-12s %-10s %s\n' "--------" "------" "----" "------" "--------------"
+
+    for box in "${boxes[@]}"; do
+        local status user preset home
+        status="$(podman inspect --format '{{.State.Status}}' "$box" 2>/dev/null || echo "unknown")"
+        user="$(podman inspect --format '{{index .Config.Labels "minibox.user"}}' "$box" 2>/dev/null || echo "-")"
+        preset="$(podman inspect --format '{{index .Config.Labels "minibox.preset"}}' "$box" 2>/dev/null || echo "custom")"
+        home="$(podman inspect --format '{{index .Config.Labels "minibox.home"}}' "$box" 2>/dev/null || echo "-")"
+
+        printf '%-18s %-12s %-12s %-10s %s\n' "$box" "$status" "$user" "$preset" "$home"
+    done
+}
+
+## Removes a container, optionally purging its isolated home folder.
+## Arguments:
+##   $* Command line arguments.
+cmd_rm() {
+    if [[ $# -lt 1 ]]; then
+        die "Missing box name. Usage: minibox rm <box-name> [--purge]"
+    fi
+
+    local box_name="$1"
+    shift
+
+    local purge_home=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --purge|--purge-home)
+                purge_home=true
+                ;;
+            *)
+                die "Invalid option: $1"
+                ;;
+        esac
+        shift
+    done
+
+    if ! is_box_exist "$box_name"; then
+        die "Box '$box_name' does not exist."
+    fi
+
+    local target_home
+    target_home="$(podman inspect --format '{{index .Config.Labels "minibox.home"}}' "$box_name" 2>/dev/null || true)"
+    if [[ -z "$target_home" ]]; then
+        target_home="$MINIBOX_BOXES_DIR/$box_name/home"
+    fi
+
+    if is_box_running "$box_name"; then
+        log_info "Stopping container '$box_name' before removal..."
+        podman stop -t 2 "$box_name" >/dev/null 2>&1 || true
+    fi
+
+    log_info "Removing container '$box_name' from Podman..."
+    podman rm -f "$box_name" >/dev/null
+
+    # Clean metadata directory
+    local meta_dir="$MINIBOX_BOXES_DIR/$box_name"
+    if [[ -f "$meta_dir/config.env" ]]; then
+        rm -f "$meta_dir/config.env"
+    fi
+
+    if [[ "$purge_home" == "true" ]]; then
+        if [[ -d "$target_home" ]]; then
+            log_warn "--purge flag specified. Deleting home directory data: $target_home"
+            rm -rf "$target_home"
+        fi
+        rm -rf "$meta_dir"
+        log_info "Successfully removed box '$box_name' and its home directory."
+    else
+        log_info "Successfully removed container '$box_name'."
+        log_info "Home directory preserved at: $target_home"
+        log_info "(Use 'minibox rm $box_name --purge' to permanently delete home data)."
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Main Entrypoint
+# -----------------------------------------------------------------------------
+
+main() {
+    check_prerequisites
+
+    if [[ $# -lt 1 ]]; then
+        cmd_help
+        exit 0
+    fi
+
+    local subcommand="$1"
+    shift
+
+    case "$subcommand" in
+        create)
+            cmd_create "$@"
+            ;;
+        start)
+            cmd_start "$@"
+            ;;
+        stop)
+            cmd_stop "$@"
+            ;;
+        restart)
+            cmd_restart "$@"
+            ;;
+        shell|enter|exec)
+            cmd_shell "$@"
+            ;;
+        root)
+            cmd_root "$@"
+            ;;
+        list|ls)
+            cmd_list "$@"
+            ;;
+        rm|delete)
+            cmd_rm "$@"
+            ;;
+        gpu-probe)
+            cmd_gpu_probe "$@"
+            ;;
+        provision|build)
+            cmd_provision "$@"
+            ;;
+        version|-v|--version)
+            printf 'minibox version %s\n' "$MINIBOX_VERSION"
+            ;;
+        help|-h|--help)
+            cmd_help
+            ;;
+        *)
+            die "Unsupported command '$subcommand'. Run 'minibox help' to view available commands."
+            ;;
+    esac
+}
+
+main "$@"

@@ -1,0 +1,61 @@
+# syntax=docker/dockerfile:1
+FROM debian:latest
+
+LABEL org.opencontainers.image.title="minibox-debian-wine"
+LABEL org.opencontainers.image.description="Debian GUI container with Wine, Winetricks, 32-bit multiarch, DXVK and fonts"
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN dpkg --add-architecture i386 \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+    sudo \
+    ca-certificates \
+    locales \
+    curl \
+    wget \
+    gnupg \
+    procps \
+    psmisc \
+    bash \
+    bash-completion \
+    libwayland-client0 \
+    wayland-protocols \
+    libgl1-mesa-dri \
+    libgl1-mesa-dri:i386 \
+    libglx-mesa0 \
+    libglx-mesa0:i386 \
+    libegl1-mesa \
+    libegl1-mesa:i386 \
+    libvulkan1 \
+    libvulkan1:i386 \
+    mesa-vulkan-drivers \
+    mesa-vulkan-drivers:i386 \
+    vulkan-tools \
+    pipewire \
+    pipewire-pulse \
+    pipewire-alsa \
+    libspa-0.2-modules \
+    wine \
+    wine32 \
+    wine64 \
+    cabextract \
+    zenity \
+    xz-utils \
+    p7zip-full \
+    fonts-dejavu-core \
+    fonts-liberation \
+    xdg-user-dirs \
+    xdg-utils \
+    && wget -O /usr/local/bin/winetricks https://raw.githubusercontent.com/Winetricks/winetricks/master/src/winetricks \
+    && chmod +x /usr/local/bin/winetricks \
+    && echo "%sudo ALL=(ALL:ALL) NOPASSWD: ALL" > /etc/sudoers.d/minibox \
+    && echo "ALL ALL=(ALL:ALL) NOPASSWD: ALL" >> /etc/sudoers.d/minibox \
+    && chmod 0440 /etc/sudoers.d/minibox \
+    && sed -i -e 's/# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen \
+    && locale-gen \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV LANG=en_US.UTF-8
+ENV LC_ALL=en_US.UTF-8

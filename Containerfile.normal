@@ -1,0 +1,44 @@
+# syntax=docker/dockerfile:1
+FROM debian:latest
+
+LABEL org.opencontainers.image.title="minibox-debian-normal"
+LABEL org.opencontainers.image.description="Standard Debian GUI container with Wayland, Mesa DRI, Vulkan, PipeWire and sudo"
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    sudo \
+    ca-certificates \
+    locales \
+    curl \
+    wget \
+    gnupg \
+    procps \
+    psmisc \
+    bash \
+    bash-completion \
+    libwayland-client0 \
+    wayland-protocols \
+    libgl1-mesa-dri \
+    libglx-mesa0 \
+    libegl1-mesa \
+    libvulkan1 \
+    mesa-vulkan-drivers \
+    vulkan-tools \
+    pipewire \
+    pipewire-pulse \
+    pipewire-alsa \
+    libspa-0.2-modules \
+    fonts-dejavu-core \
+    xdg-user-dirs \
+    xdg-utils \
+    && echo "%sudo ALL=(ALL:ALL) NOPASSWD: ALL" > /etc/sudoers.d/minibox \
+    && echo "ALL ALL=(ALL:ALL) NOPASSWD: ALL" >> /etc/sudoers.d/minibox \
+    && chmod 0440 /etc/sudoers.d/minibox \
+    && sed -i -e 's/# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen \
+    && locale-gen \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV LANG=en_US.UTF-8
+ENV LC_ALL=en_US.UTF-8

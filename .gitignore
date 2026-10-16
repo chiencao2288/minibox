@@ -1,0 +1,13 @@
+# Local minibox runtime data
+.local/
+*.log
+
+# Editor & IDE directories
+.vscode/
+.idea/
+*.swp
+*~
+
+# Temporary & test files
+test/
+tmp/
