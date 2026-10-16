@@ -15,7 +15,6 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_BASE: ghcr.io/${{ github.repository_owner }}/debian-box
 
 jobs:
   build-and-push:
@@ -27,16 +26,16 @@ jobs:
           - preset: normal
             file: Containerfile.normal
             tags: |
-              latest
-              normal
+              ghcr.io/chiencao2288/debian-box:latest
+              ghcr.io/chiencao2288/debian-box:normal
           - preset: wine
             file: Containerfile.wine
             tags: |
-              wine
+              ghcr.io/chiencao2288/debian-box:wine
           - preset: ai
             file: Containerfile.ai
             tags: |
-              ai
+              ghcr.io/chiencao2288/debian-box:ai
 
     steps:
       - name: Checkout Repository
@@ -52,19 +51,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Format Docker Tags
-        id: tags
-        run: |
-          TAG_FLAGS=""
-          for tag in ${{ matrix.tags }}; do
-            TAG_FLAGS="${TAG_FLAGS} -t ${{ env.IMAGE_BASE }}:${tag}"
-          done
-          echo "tag_flags=${TAG_FLAGS}" >> "$GITHUB_OUTPUT"
-
       - name: Build and Push Image
-        run: |
-          docker buildx build \
-            --file ${{ matrix.file }} \
-            ${{ steps.tags.outputs.tag_flags }} \
-            --push \
-            .
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.file }}
+          push: true
+          tags: ${{ matrix.tags }}
