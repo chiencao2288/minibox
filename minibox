@@ -486,6 +486,7 @@ cmd_create() {
         --label "minibox.image=$final_image" \
         --security-opt label=disable \
         --ipc=host \
+        --net=host \
         --userns=keep-id \
         --passwd-entry="$target_user:x:$host_uid:$host_gid:$target_user:/home/$target_user:/bin/bash" \
         --group-entry="$target_user:x:$host_gid:" \
