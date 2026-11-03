@@ -23,7 +23,7 @@ Lightweight rootless Debian GUI container manager for **Podman** on Fedora Linux
 - **Pure Wayland & PipeWire Integration:** Native Wayland socket forwarding (`wayland-0`) and PipeWire audio (`pipewire-0`) without legacy X11 overhead.
 - **3 Flexible Image Presets (`--image=...`):**
   - `normal` *(default)*: Lightweight Debian GUI base with Mesa DRI, Vulkan, Wayland, PipeWire, and NOPASSWD sudo.
-  - `wine`: Optimized for Windows games and applications. Includes multi-arch 32-bit (`i386`), Wine-staging, Winetricks, DXVK, and Microsoft core fonts.
+  - `wine`: Optimized for Windows & AAA offline gaming. Pre-installed with multi-arch 32-bit (`i386`), Wine, full Visual C++ (2005–2022 x86/x64), .NET Framework (Wine-Mono), DXVK (Vulkan DX9/10/11), GStreamer cutscene codecs, D3D compilers, and Microsoft core fonts. NOPASSWD sudo included.
   - `ai`: Optimized for local AI workloads. Includes Python 3, pip, venv, build tools, git-lfs, and CUDA runtime compatibility.
   - Custom images are also supported via arbitrary image URLs.
 
@@ -53,19 +53,27 @@ minibox <command> [options...]
 
 ### Container Management
 ```bash
-# Create a new box with the desired preset
-./minibox create my-game --image=wine --mounts
-./minibox create dev-box --image=normal
+# Create a new box with preset and optional custom volume mounts (-v)
+./minibox create dev-box --image=normal -v /path/on/host:/data
+./minibox create my-game --image=wine
 ./minibox create ai-lab --image=ai
 
 # Open an interactive shell inside the container (as box user)
-./minibox shell my-game
+./minibox enter dev-box
 
-# Launch a GUI application directly
-./minibox shell my-game winecfg
+# Run a command or launch a GUI application directly
+./minibox run my-game winecfg
 
-# Execute a command as root from the host
-./minibox root my-game apt update
+# Run a command with passwordless sudo (run & enter, no password needed)
+./minibox run dev-box sudo apt update
+
+# Copy files between host and container
+./minibox cp ./model.bin ai-lab:/home/chiencao/
+./minibox cp ai-lab:/home/chiencao/output.png ./
+
+# Hot-mount host directory into running container (without restart)
+./minibox mount dev-box /run/media/chiencao/USB /mnt/usb
+./minibox umount dev-box /mnt/usb
 
 # Container lifecycle management
 ./minibox list
@@ -78,6 +86,18 @@ minibox <command> [options...]
 
 # Permanently delete container and its isolated home folder
 ./minibox rm my-game --purge
+```
+
+### Custom Storage Root (`MINIBOX_HOME`)
+By default, all boxes and their isolated home directories reside in `~/.local/share/minibox/boxes`. You can override this root to any secondary NVMe, SSD, or external drive:
+
+```bash
+# Set in your environment (~/.bashrc) or per command:
+export MINIBOX_HOME="/mnt/nvme/minibox"
+# (or via ./.env: MINIBOX_HOME="/mnt/nvme/minibox")
+
+# Boxes created will automatically be rooted at /mnt/nvme/minibox/boxes/<name>/home:
+minibox create game-box --image=wine
 ```
 
 ### Hardware Diagnostics

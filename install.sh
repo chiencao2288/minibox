@@ -141,8 +141,8 @@ printf "────────────────────────
 if [[ "${path_configured}" == "true" ]]; then
     printf "${C_BOLD}🚀 Quick Start:${C_RESET}\n"
     printf "   minibox create dev-box            # Create standard Debian container\n"
-    printf "   minibox create --ai ai-box        # Create AI container with CUDA/PyTorch\n"
-    printf "   minibox shell dev-box             # Open interactive shell\n"
+    printf "   minibox create ai-box --image=ai  # Create AI container with CUDA/PyTorch\n"
+    printf "   minibox enter dev-box             # Open interactive shell\n"
     printf "   minibox list                      # List all managed containers\n"
     printf "   minibox help                      # Show all commands\n\n"
 else

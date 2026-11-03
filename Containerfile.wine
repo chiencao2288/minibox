@@ -2,7 +2,7 @@
 FROM debian:latest
 
 LABEL org.opencontainers.image.title="minibox-debian-wine"
-LABEL org.opencontainers.image.description="Debian GUI container with Wine, Winetricks, 32-bit multiarch, DXVK and fonts"
+LABEL org.opencontainers.image.description="Debian GUI gaming container with Wine, Visual C++ 2005-2022, .NET (Wine-Mono), DXVK, GStreamer codecs and fonts"
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -45,8 +45,24 @@ RUN dpkg --add-architecture i386 \
     zenity \
     xz-utils \
     p7zip-full \
+    unzip \
+    xvfb \
+    xauth \
+    dxvk \
+    dxvk-wine64 \
+    gstreamer1.0-plugins-base \
+    gstreamer1.0-plugins-base:i386 \
+    gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-good:i386 \
+    gstreamer1.0-plugins-bad \
+    gstreamer1.0-plugins-bad:i386 \
+    gstreamer1.0-plugins-ugly \
+    gstreamer1.0-plugins-ugly:i386 \
+    gstreamer1.0-libav \
+    gstreamer1.0-libav:i386 \
     fonts-dejavu-core \
     fonts-liberation \
+    fonts-wine \
     xdg-user-dirs \
     xdg-utils \
     && wget -O /usr/local/bin/winetricks https://raw.githubusercontent.com/Winetricks/winetricks/master/src/winetricks \
@@ -58,6 +74,28 @@ RUN dpkg --add-architecture i386 \
     && locale-gen \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+# Pre-install official Wine-Mono (.NET) and Wine-Gecko into system directories
+RUN mkdir -p /usr/share/wine/mono /usr/share/wine/gecko \
+    && wget -q -O /usr/share/wine/mono/wine-mono-9.4.0-x86.msi https://dl.winehq.org/wine/wine-mono/9.4.0/wine-mono-9.4.0-x86.msi \
+    && wget -q -O /usr/share/wine/gecko/wine-gecko-2.47.4-x86.msi https://dl.winehq.org/wine/wine-gecko/2.47.4/wine-gecko-2.47.4-x86.msi \
+    && wget -q -O /usr/share/wine/gecko/wine-gecko-2.47.4-x86_64.msi https://dl.winehq.org/wine/wine-gecko/2.47.4/wine-gecko-2.47.4-x86_64.msi
+
+# Pre-initialize master gaming prefix with Visual C++ 2005-2022, .NET, corefonts, D3D compilers and DXVK
+RUN mkdir -p /opt/default-wineprefix \
+    && WINEPREFIX=/opt/default-wineprefix WINEDEBUG=-all xvfb-run -a wineboot --init \
+    && WINEPREFIX=/opt/default-wineprefix WINEDEBUG=-all xvfb-run -a winetricks -q \
+        corefonts \
+        vcrun2005 \
+        vcrun2008 \
+        vcrun2010 \
+        vcrun2012 \
+        vcrun2013 \
+        vcrun2022 \
+        d3dcompiler_43 \
+        d3dcompiler_47 \
+    && chmod -R ugo+rwX /opt/default-wineprefix \
+    && rm -rf /root/.cache/winetricks
 
 ENV LANG=en_US.UTF-8
 ENV LC_ALL=en_US.UTF-8

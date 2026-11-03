@@ -20,10 +20,6 @@ readonly PRESET_NORMAL="${DEFAULT_REGISTRY_BASE}:normal"
 readonly PRESET_WINE="${DEFAULT_REGISTRY_BASE}:wine"
 readonly PRESET_AI="${DEFAULT_REGISTRY_BASE}:ai"
 
-readonly XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
-readonly MINIBOX_DATA_DIR="$XDG_DATA_HOME/minibox"
-readonly MINIBOX_BOXES_DIR="$MINIBOX_DATA_DIR/boxes"
-
 # -----------------------------------------------------------------------------
 # Logging Functions
 # -----------------------------------------------------------------------------
@@ -56,6 +52,48 @@ die() {
     log_error "$*"
     exit 1
 }
+
+# -----------------------------------------------------------------------------
+# Storage Path Resolution (Supports MINIBOX_HOME)
+# -----------------------------------------------------------------------------
+
+readonly XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+readonly DEFAULT_MINIBOX_DATA_DIR="$XDG_DATA_HOME/minibox"
+
+## Resolves the root data directory for minibox.
+## Inspects MINIBOX_HOME environment variable, local .env, and user config.
+## Returns:
+##   Canonical path to data directory.
+resolve_storage_dir() {
+    local candidate="${MINIBOX_HOME:-}"
+
+    # Check local .env in current working directory
+    if [[ -z "$candidate" && -f "./.env" ]]; then
+        candidate="$(grep -E '^[[:space:]]*MINIBOX_HOME=' "./.env" 2>/dev/null | head -n 1 | cut -d= -f2- | tr -d '"'\'' ' || true)"
+    fi
+
+    # Check ~/.config/minibox/config
+    if [[ -z "$candidate" && -f "${HOME}/.config/minibox/config" ]]; then
+        candidate="$(grep -E '^[[:space:]]*MINIBOX_HOME=' "${HOME}/.config/minibox/config" 2>/dev/null | head -n 1 | cut -d= -f2- | tr -d '"'\'' ' || true)"
+    fi
+
+    if [[ -n "$candidate" ]]; then
+        candidate="${candidate/#\~/$HOME}"
+        if mkdir -p "$candidate" 2>/dev/null && [[ -w "$candidate" ]]; then
+            printf '%s' "$(cd "$candidate" 2>/dev/null && pwd -P)"
+            return 0
+        else
+            log_warn "MINIBOX_HOME='$candidate' is not valid or writable. Falling back to default: $DEFAULT_MINIBOX_DATA_DIR"
+        fi
+    fi
+
+    mkdir -p "$DEFAULT_MINIBOX_DATA_DIR" 2>/dev/null || true
+    printf '%s' "$DEFAULT_MINIBOX_DATA_DIR"
+}
+
+MINIBOX_DATA_DIR="$(resolve_storage_dir)"
+readonly MINIBOX_DATA_DIR
+readonly MINIBOX_BOXES_DIR="$MINIBOX_DATA_DIR/boxes"
 
 # -----------------------------------------------------------------------------
 # Helper Functions
@@ -189,17 +227,6 @@ detect_gpu_args() {
     printf '%s\n' "--group-add" "keep-groups"
 }
 
-## Scans external and secondary disk mountpoints (/run/media, /mnt).
-## Excludes host root, host home, and system hierarchies.
-## Outputs:
-##   Array of podman argument strings separated by newlines.
-detect_mount_args() {
-    local mount_target
-    while IFS= read -r mount_target; do
-        [[ -n "$mount_target" && -d "$mount_target" ]] || continue
-        printf '%s\n' "--volume" "$mount_target:$mount_target:rw,rslave"
-    done < <(findmnt -rn -o TARGET 2>/dev/null | grep -E '^/(run/media|mnt)/' || true)
-}
 
 ## Checks if container currently exists in Podman.
 ## Arguments:
@@ -243,6 +270,11 @@ PS1='\[\033[01;32m\]\u@\[\033[01;35m\]\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m
 alias ls='ls --color=auto'
 alias ll='ls -la --color=auto'
 alias grep='grep --color=auto'
+
+# Auto-deploy gaming Wineprefix if template exists and local prefix is empty
+if [ ! -d "$HOME/.wine" ] && [ -d "/opt/default-wineprefix" ]; then
+    cp -a /opt/default-wineprefix "$HOME/.wine" 2>/dev/null || true
+fi
 EOF
     fi
 
@@ -272,11 +304,14 @@ Usage:
 
 Container Management Commands:
   create <box-name> [options...]   Create a new box
+  enter <box-name>                 Launch interactive shell as box user
+  run <box-name> <command...>      Execute a command inside box (supports sudo)
+  mount <box> <host-path> <dest>   Hot-mount a host directory into running container
+  umount <box> <dest>              Unmount hot-mounted directory from container
+  cp, copy <src> <dest>            Copy files between host and container
   start <box-name>                 Start box in persistent daemon mode
   stop <box-name>                  Stop a running box
   restart <box-name>               Restart a box
-  shell <box-name> [command...]    Launch interactive shell or run command as box user
-  root <box-name> [command...]     Launch interactive shell or run command as root
   list, ls                         List all managed boxes and their statuses
   rm <box-name> [--purge]          Remove container (add --purge to delete isolated home)
 
@@ -289,15 +324,20 @@ Diagnostics & Setup Commands:
 Creation Options (create):
   --image=<preset|url>             Image preset: normal (default), wine, ai, or custom image URL
   --user=<name>                    Override container username (default: matches host user)
-  --home=<path>                    Specify custom host home directory (default: ~/.local/share/minibox/boxes/<box>/home)
-  --mounts                         Auto-mount external/secondary drives (/run/media, /mnt) with RW access
+  -v, --volume=<host>:<dest>       Mount custom directory into container (can be repeated)
 
+
+Environment Variables:
+  MINIBOX_HOME                     Custom root storage directory for boxes (default: ~/.local/share/minibox)
 Examples:
-  minibox create game-box --image=wine --mounts
-  minibox shell game-box
-  minibox root game-box apt update
+  minibox create dev-box --image=normal -v /path/on/host:/data
+  minibox enter dev-box
+  minibox run dev-box sudo apt update
+  minibox cp ./file.txt dev-box:/home/chiencao/
+  minibox mount dev-box /run/media/chiencao/USB /mnt/usb
+  minibox cp dev-box:/home/chiencao/result.png ./
   minibox list
-  minibox rm game-box
+  minibox rm dev-box
 EOF
 }
 
@@ -379,8 +419,7 @@ cmd_create() {
     local image_preset="normal"
     local raw_image=""
     local user_override=""
-    local home_override=""
-    local enable_mounts=false
+    local -a custom_volumes=()
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -390,11 +429,21 @@ cmd_create() {
             --user=*)
                 user_override="${1#*=}"
                 ;;
-            --home=*)
-                home_override="${1#*=}"
+            -v|--volume)
+                if [[ $# -lt 2 || "$2" == -* ]]; then
+                    die "Option $1 requires an argument. Example: -v /host/path:/container/path"
+                fi
+                custom_volumes+=("$2")
+                shift
+                ;;
+            -v=*|--volume=*)
+                custom_volumes+=("${1#*=}")
+                ;;
+            --home=*|--home)
+                die "Option '--home' has been removed. Each box strictly uses its isolated directory at '~/.local/share/minibox/boxes/<box>/home'. Use '-v /host/path:/container/path' to mount extra directories."
                 ;;
             --mounts|--mount-drives)
-                enable_mounts=true
+                die "Option '--mounts' has been removed. USB and external drives are not mounted by default. Use '-v /host/path:/container/path' to mount specific paths."
                 ;;
             -h|--help)
                 cmd_help
@@ -429,13 +478,8 @@ cmd_create() {
         target_user="minibox"
     fi
 
-    # Resolve isolated home path
-    local target_home
-    if [[ -n "$home_override" ]]; then
-        target_home="$home_override"
-    else
-        target_home="$MINIBOX_BOXES_DIR/$box_name/home"
-    fi
+    # Resolve isolated home path (strictly isolated, no host pollution)
+    local target_home="$MINIBOX_BOXES_DIR/$box_name/home"
 
     local host_uid host_gid
     host_uid="$(id -u)"
@@ -445,7 +489,9 @@ cmd_create() {
     log_info "  - User:      $target_user (UID: $host_uid, GID: $host_gid)"
     log_info "  - Home:      $target_home"
     log_info "  - Image:     $final_image ($image_preset)"
-    log_info "  - Mounts:    $enable_mounts"
+    if [[ ${#custom_volumes[@]} -gt 0 ]]; then
+        log_info "  - Volumes:   ${custom_volumes[*]}"
+    fi
 
     # Prepare home directory and shell skeleton
     init_home_skeleton "$target_home"
@@ -468,15 +514,16 @@ cmd_create() {
     local -a gpu_args=()
     mapfile -t gpu_args < <(detect_gpu_args)
 
-    local -a mount_args=()
-    if [[ "$enable_mounts" == "true" ]]; then
-        mapfile -t mount_args < <(detect_mount_args)
-    fi
+    local -a volume_args=()
+    for vol in "${custom_volumes[@]}"; do
+        volume_args+=("--volume" "$vol")
+    done
 
     # Run native Podman create command
     podman create \
         --name "$box_name" \
         --hostname "$box_name" \
+        --add-host "$box_name:127.0.0.1" \
         --init \
         --label "minibox=true" \
         --label "minibox.name=$box_name" \
@@ -495,9 +542,16 @@ cmd_create() {
         "${wayland_args[@]}" \
         "${pipewire_args[@]}" \
         "${gpu_args[@]}" \
-        "${mount_args[@]}" \
+        "${volume_args[@]}" \
         "$final_image" \
         sleep infinity >/dev/null
+    # Deploy pre-configured gaming Wineprefix if provided by the container image
+    if [[ ! -d "$target_home/.wine" ]]; then
+        if podman cp "$box_name:/opt/default-wineprefix" "$target_home/.wine" 2>/dev/null; then
+            log_info "Pre-configured gaming Wineprefix deployed (Visual C++ 2005-2022, .NET, DXVK)."
+        fi
+    fi
+
 
     # Persist metadata for standalone inspection
     local meta_dir="$MINIBOX_BOXES_DIR/$box_name"
@@ -508,11 +562,11 @@ CONTAINER_USER="$target_user"
 BOX_HOME="$target_home"
 IMAGE="$final_image"
 PRESET="$image_preset"
-MOUNTS="$enable_mounts"
+VOLUMES="${custom_volumes[*]:-none}"
 CREATED_AT="$(date -Iseconds)"
 EOF
 
-    log_info "Box '$box_name' created successfully! Run 'minibox shell $box_name' to start using it."
+    log_info "Box '$box_name' created successfully! Run 'minibox enter $box_name' to start using it."
 }
 
 ## Starts an existing stopped container.
@@ -579,13 +633,12 @@ cmd_restart() {
     log_info "Box '$box_name' restarted."
 }
 
-## Enters container shell or executes command as unprivileged container user.
+## Enters container interactive shell as unprivileged container user.
 ## Arguments:
 ##   $1 Box name.
-##   $2.. Command arguments (optional).
-cmd_shell() {
+cmd_enter() {
     if [[ $# -lt 1 ]]; then
-        die "Missing box name. Usage: minibox shell <box-name> [command...]"
+        die "Missing box name. Usage: minibox enter <box-name>"
     fi
     local box_name="$1"
     shift
@@ -612,27 +665,290 @@ cmd_shell() {
         it_flag+=("-t")
     fi
 
-    if [[ $# -eq 0 ]]; then
-        exec podman exec "${it_flag[@]}" \
-            --user="$target_user" \
-            -e HOME="/home/$target_user" \
-            -e USER="$target_user" \
-            -e WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" \
-            -e XDG_RUNTIME_DIR="/run/user/$host_uid" \
-            -e PIPEWIRE_RUNTIME_DIR="/run/user/$host_uid" \
-            -e TERM="${TERM:-xterm-256color}" \
-            "$box_name" /bin/bash --login
-    else
-        exec podman exec "${it_flag[@]}" \
-            --user="$target_user" \
-            -e HOME="/home/$target_user" \
-            -e USER="$target_user" \
-            -e WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" \
-            -e XDG_RUNTIME_DIR="/run/user/$host_uid" \
-            -e PIPEWIRE_RUNTIME_DIR="/run/user/$host_uid" \
-            -e TERM="${TERM:-xterm-256color}" \
-            "$box_name" "$@"
+    exec podman exec "${it_flag[@]}" \
+        --user="$target_user" \
+        -e HOME="/home/$target_user" \
+        -e USER="$target_user" \
+        -e WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" \
+        -e XDG_RUNTIME_DIR="/run/user/$host_uid" \
+        -e PIPEWIRE_RUNTIME_DIR="/run/user/$host_uid" \
+        -e TERM="${TERM:-xterm-256color}" \
+        "$box_name" /bin/bash --login
+}
+
+## Executes command inside container as unprivileged container user (supports sudo).
+## Arguments:
+##   $1 Box name.
+##   $2.. Command arguments.
+cmd_run() {
+    if [[ $# -lt 2 ]]; then
+        die "Missing command. Usage: minibox run <box-name> <command...> (or use 'minibox enter <box-name>' for interactive shell)"
     fi
+    local box_name="$1"
+    shift
+
+    if ! is_box_exist "$box_name"; then
+        die "Box '$box_name' does not exist."
+    fi
+
+    if ! is_box_running "$box_name"; then
+        cmd_start "$box_name"
+    fi
+
+    local target_user
+    target_user="$(podman inspect --format '{{index .Config.Labels "minibox.user"}}' "$box_name" 2>/dev/null || true)"
+    if [[ -z "$target_user" ]]; then
+        target_user="$(sanitize_username "$box_name")"
+    fi
+
+    local host_uid
+    host_uid="$(id -u)"
+
+    local -a it_flag=("-i")
+    if [[ -t 0 && -t 1 ]]; then
+        it_flag+=("-t")
+    fi
+
+    exec podman exec "${it_flag[@]}" \
+        --user="$target_user" \
+        -e HOME="/home/$target_user" \
+        -e USER="$target_user" \
+        -e WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}" \
+        -e XDG_RUNTIME_DIR="/run/user/$host_uid" \
+        -e PIPEWIRE_RUNTIME_DIR="/run/user/$host_uid" \
+        -e TERM="${TERM:-xterm-256color}" \
+        "$box_name" "$@"
+}
+
+## Copies files/directories between host and container.
+## Arguments:
+##   $* cp arguments.
+cmd_cp() {
+    if [[ $# -lt 2 ]]; then
+        cat <<'EOF' >&2
+Error: Missing arguments for cp.
+Usage:
+  minibox cp <src> <dest>
+  minibox cp in <box-name> <host-path> <container-path>
+  minibox cp out <box-name> <container-path> <host-path>
+
+Examples:
+  # Copy file from host into container:
+  minibox cp ./model.bin my-box:/home/chiencao/
+  minibox cp in my-box ./model.bin /home/chiencao/
+
+  # Copy file from container to host:
+  minibox cp my-box:/home/chiencao/output.png ./
+  minibox cp out my-box /home/chiencao/output.png ./
+EOF
+        exit 1
+    fi
+
+    local src=""
+    local dest=""
+
+    if [[ "$1" == "in" ]]; then
+        if [[ $# -ne 4 ]]; then
+            die "Usage: minibox cp in <box-name> <host-path> <container-path>"
+        fi
+        local box="$2"
+        local host_path="$3"
+        local container_path="$4"
+        src="$host_path"
+        dest="$box:$container_path"
+    elif [[ "$1" == "out" ]]; then
+        if [[ $# -ne 4 ]]; then
+            die "Usage: minibox cp out <box-name> <container-path> <host-path>"
+        fi
+        local box="$2"
+        local container_path="$3"
+        local host_path="$4"
+        src="$box:$container_path"
+        dest="$host_path"
+    elif [[ $# -eq 3 ]]; then
+        local box="$1"
+        if is_box_exist "$box"; then
+            if [[ -e "$2" ]]; then
+                src="$2"
+                dest="$box:$3"
+            else
+                src="$box:$2"
+                dest="$3"
+            fi
+        else
+            die "Box '$box' not found. Usage: minibox cp <src> <dest>"
+        fi
+    elif [[ $# -eq 2 ]]; then
+        src="$1"
+        dest="$2"
+    else
+        die "Invalid arguments. Usage: minibox cp <src> <dest>"
+    fi
+
+    if [[ "$src" =~ ^([^:]+):(.*)$ ]]; then
+        local box_check="${BASH_REMATCH[1]}"
+        if ! is_box_exist "$box_check"; then
+            die "Box '$box_check' does not exist."
+        fi
+    fi
+    if [[ "$dest" =~ ^([^:]+):(.*)$ ]]; then
+        local box_check="${BASH_REMATCH[1]}"
+        if ! is_box_exist "$box_check"; then
+            die "Box '$box_check' does not exist."
+        fi
+    fi
+
+    log_info "Copying '$src' -> '$dest'..."
+    podman cp "$src" "$dest"
+    log_info "Copy completed successfully."
+}
+
+## Hot-mounts a host directory into a running container's mount namespace.
+## Arguments:
+##   $1 Box name.
+##   $2 Host path.
+##   $3 Container target path.
+cmd_mount() {
+    if [[ $# -lt 3 ]]; then
+        die "Usage: minibox mount <box-name> <host-path> <container-target-path>"
+    fi
+    local box_name="$1"
+    local raw_host_path="$2"
+    local container_path="$3"
+
+    if ! is_box_exist "$box_name"; then
+        die "Box '$box_name' does not exist."
+    fi
+
+    if ! is_box_running "$box_name"; then
+        log_info "Box '$box_name' is not running. Starting box..."
+        cmd_start "$box_name"
+    fi
+
+    if [[ ! -e "$raw_host_path" ]]; then
+        die "Host path '$raw_host_path' does not exist."
+    fi
+
+    local host_path
+    host_path="$(realpath "$raw_host_path")"
+
+    local pid
+    pid="$(podman inspect "$box_name" --format '{{.State.Pid}}' 2>/dev/null || true)"
+    if [[ -z "$pid" || "$pid" -le 0 ]]; then
+        die "Failed to determine process PID for box '$box_name'."
+    fi
+
+    # Ensure target directory exists inside container
+    podman exec -u root "$box_name" mkdir -p "$container_path"
+
+    log_info "Hot-mounting '$host_path' -> '$box_name:$container_path'..."
+    if ! podman unshare python3 - "$host_path" "$container_path" "$pid" <<'PYEOF'
+import os, sys, ctypes
+
+SYS_open_tree = 428
+SYS_move_mount = 429
+OPEN_TREE_CLONE = 1
+MOVE_MOUNT_F_EMPTY_PATH = 4
+CLONE_NEWNS = 0x00020000
+
+host_path = sys.argv[1].encode('utf-8')
+target_path = sys.argv[2].encode('utf-8')
+pid = sys.argv[3]
+
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+
+# 1. Open mount tree from host
+tree_fd = libc.syscall(SYS_open_tree, -100, host_path, OPEN_TREE_CLONE)
+if tree_fd < 0:
+    errno = ctypes.get_errno()
+    sys.stderr.write(f"open_tree failed ({errno}): {os.strerror(errno)}\n")
+    sys.exit(1)
+
+# 2. Open container mount namespace
+try:
+    ns_fd = os.open(f"/proc/{pid}/ns/mnt", os.O_RDONLY)
+except Exception as e:
+    sys.stderr.write(f"Cannot access container mount namespace: {e}\n")
+    sys.exit(1)
+
+# 3. Enter container mount namespace
+if libc.setns(ns_fd, CLONE_NEWNS) != 0:
+    errno = ctypes.get_errno()
+    sys.stderr.write(f"setns failed ({errno}): {os.strerror(errno)}\n")
+    sys.exit(1)
+
+# 4. Attach cloned mount tree to target path in container
+if libc.syscall(SYS_move_mount, tree_fd, b"", -100, target_path, MOVE_MOUNT_F_EMPTY_PATH) != 0:
+    errno = ctypes.get_errno()
+    sys.stderr.write(f"move_mount failed ({errno}): {os.strerror(errno)}\n")
+    sys.exit(1)
+PYEOF
+    then
+        die "Failed to hot-mount '$host_path' into container."
+    fi
+
+    log_info "Successfully hot-mounted '$host_path' to '$box_name:$container_path'."
+}
+
+## Unmounts a hot-mounted directory from a running container.
+## Arguments:
+##   $1 Box name.
+##   $2 Container path.
+cmd_umount() {
+    if [[ $# -lt 2 ]]; then
+        die "Usage: minibox umount <box-name> <container-path>"
+    fi
+    local box_name="$1"
+    local container_path="$2"
+
+    if ! is_box_exist "$box_name"; then
+        die "Box '$box_name' does not exist."
+    fi
+
+    if ! is_box_running "$box_name"; then
+        log_info "Box '$box_name' is not running (mounts are already released)."
+        return 0
+    fi
+
+    local pid
+    pid="$(podman inspect "$box_name" --format '{{.State.Pid}}' 2>/dev/null || true)"
+    if [[ -z "$pid" || "$pid" -le 0 ]]; then
+        die "Failed to determine process PID for box '$box_name'."
+    fi
+
+    log_info "Unmounting '$box_name:$container_path'..."
+    if ! podman unshare python3 - "$container_path" "$pid" <<'PYEOF'
+import os, sys, ctypes
+
+CLONE_NEWNS = 0x00020000
+MNT_DETACH = 2
+
+target_path = sys.argv[1].encode('utf-8')
+pid = sys.argv[2]
+
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+
+try:
+    ns_fd = os.open(f"/proc/{pid}/ns/mnt", os.O_RDONLY)
+except Exception as e:
+    sys.stderr.write(f"Cannot access container mount namespace: {e}\n")
+    sys.exit(1)
+
+if libc.setns(ns_fd, CLONE_NEWNS) != 0:
+    errno = ctypes.get_errno()
+    sys.stderr.write(f"setns failed ({errno}): {os.strerror(errno)}\n")
+    sys.exit(1)
+
+if libc.umount2(target_path, MNT_DETACH) != 0:
+    errno = ctypes.get_errno()
+    sys.stderr.write(f"umount failed ({errno}): {os.strerror(errno)}\n")
+    sys.exit(1)
+PYEOF
+    then
+        die "Failed to unmount '$container_path' from container."
+    fi
+
+    log_info "Successfully unmounted '$box_name:$container_path'."
 }
 
 ## Enters container shell or executes command as root.
@@ -786,8 +1102,23 @@ main() {
         restart)
             cmd_restart "$@"
             ;;
-        shell|enter|exec)
-            cmd_shell "$@"
+        enter)
+            cmd_enter "$@"
+            ;;
+        run|exec)
+            cmd_run "$@"
+            ;;
+        shell)
+            die "The 'shell' command has been removed. Use 'minibox enter <box-name>' for an interactive shell, or 'minibox run <box-name> <command>' to execute a command."
+            ;;
+        cp|copy)
+            cmd_cp "$@"
+            ;;
+        mount)
+            cmd_mount "$@"
+            ;;
+        umount|unmount)
+            cmd_umount "$@"
             ;;
         root)
             cmd_root "$@"
